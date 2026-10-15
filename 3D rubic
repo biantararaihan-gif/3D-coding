@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Holographic Glass Multi-Shape Grid</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000000; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.min.js"
+  }
+}
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
+import Stats from 'three/addons/libs/stats.module.js';
+import GUI from 'lil-gui';
+
+// ============================================================
+//  Scene Parameters
+// ============================================================
+const PARAMS = {
+  // Camera
+  camDistance: 5.86,
+  camHeight: -5.18,
+  fov: 42.0,
+
+  // Animation
+  timeScale: 1.0,
+  paused: false,
+  rotSpeed: 0.22,
+  pulseSpeed: 2.0,
+  pulseFreq: 2.0,
+  sweepSpeed: 0.55,
+  holoSpeed: 0.08,
+
+  // Mouse rotation
+  dragSensitivity: 1.0,
+  inertiaDamping: 2.5,
+
+  // Geometry & Shapes (0: Cube, 1: Sphere, 2: Torus, 3: Octahedron, 4: Cylinder, 5: Gyroid)
+  shapeType: 0,
+  gridN: 5,
+  objectSize: 1.42,
+  cubeMin: 0.09,
+  cubeMax: 0.57,
+  cubeRound: 0.21,
+
+  // Material
+  glassIor: 1.25,
+  dispersion: 0.097,
+  absorbR: 3.6,
+  absorbG: 1.4,
+  absorbB: 0.9,
+  holoFreq: 1.4,
+  holoAmount: 0.35,
+
+  // Colors & Themes
+  presetTheme: 'Default Holographic',
+  backgroundColor: '#000000',
+  glassColor: '#5893d4',
+  glowColor: '#ffffff',
+
+  // Lighting
+  glowStrength: 0.63,
+  exposure: 2,
+
+  // Post Processing
+  scanlines: 0.04,
+  smaa: false,
+  supersampling: 1,
+
+  // Performance Settings
+  showFps: true,
+  dpr: 1.0,
+  maxSteps: 48,
+  interiorSteps: 16,
+  aoSamples: 2,
+  maxDist: 14.0,
+  surfEps: 0.001,
+  stepFactor: 0.9
+};
+
+const MAX_DPR = 2;
+const DRAG_RESPONSE = 18.0;
+const MAX_DELTA = 0.1;
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
+
+const PRESETS = {
+  'Default Holographic': {
+    backgroundColor: '#000000',
+    glassColor: '#5893d4',
+    glowColor: '#ffffff',
+    glowStrength: 0.63,
+    holoAmount: 0.35
+  },
+  'Cyberpunk Neon': {
+    backgroundColor: '#050010',
+    glassColor: '#ff0077',
+    glowColor: '#00f0ff',
+    glowStrength: 1.1,
+    holoAmount: 0.6
+  },
+  'Emerald Crystal': {
+    backgroundColor: '#000a04',
+    glassColor: '#00ff66',
+    glowColor: '#55ff99',
+    glowStrength: 0.8,
+    holoAmount: 0.25
+  },
+  'Golden Amber': {
+    backgroundColor: '#0c0600',
+    glassColor: '#ffaa00',
+    glowColor: '#ffeeaa',
+    glowStrength: 0.9,
+    holoAmount: 0.4
+  },
+  'Ruby Red': {
+    backgroundColor: '#0a0002',
+    glassColor: '#ff2244',
+    glowColor: '#ff6688',
+    glowStrength: 1.0,
+    holoAmount: 0.5
+  },
+  'Deep Ocean': {
+    backgroundColor: '#000814',
+    glassColor: '#0099ff',
+    glowColor: '#00e5ff',
+    glowStrength: 0.7,
+    holoAmount: 0.3
+  }
+};
+
+// Setup FPS Monitor
+const stats = new Stats();
+stats.showPanel(0);
+document.body.appendChild(stats.dom);
+
+// ============================================================
+//  Shaders with Multi-Shape SDFs
+// ============================================================
+const vertexShader = /* glsl */ `
+in vec3 position;
+void main() {
+  gl_Position = vec4(position.xy, 0.0, 1.0);
+}
+`;
+
+const fragmentShader = /* glsl */ `
+precision highp float;
+precision highp int;
+
+uniform vec2  uResolution;
+uniform vec3  uCamPos;
+uniform vec3  uCamRight;
+uniform vec3  uCamUp;
+uniform vec3  uCamForward;
+uniform float uFocal;
+
+uniform mat3  uObjRot;
+uniform float uPulse;
+
+uniform int   uShapeType;
+uniform float uCell;
+uniform float uGridHalf;
+uniform float uGridOff;
+uniform float uBoundRadius;
+uniform float uCubeMin;
+uniform float uCubeMax;
+uniform float uCubeRound;
+uniform float uPulseFreq;
+
+uniform float uMaxDist;
+uniform float uSurfEps;
+uniform float uStepFactor;
+
+uniform float uHoloFreq;
+uniform float uHoloPhase;
+uniform float uHoloAmount;
+uniform float uSweepY;
+uniform float uScanlineAmt;
+uniform float uGlowStrength;
+uniform vec3  uGlowColor;
+uniform float uExposure;
+
+uniform float uGlassIor;
+uniform float uDispersion;
+uniform vec3  uGlassAbsorb;
+uniform vec3  uBgColor;
+
+out vec4 fragColor;
+
+const float TAU = 6.28318530718;
+
+vec2 sphereIntersect(vec3 ro, vec3 rd, float r) {
+  float b = dot(ro, rd);
+  float c = dot(ro, ro) - r * r;
+  float h = b * b - c;
+  if (h < 0.0) return vec2(-1.0);
+  h = sqrt(h);
+  return vec2(-b - h, -b + h);
+}
+
+vec3 safeRefract(vec3 I, vec3 N, float eta) {
+  vec3 r = refract(I, N, eta);
+  return dot(r, r) < 1e-6 ? reflect(I, N) : r;
+}
+
+vec3 holoPalette(float x) {
+  vec3 c = 0.5 + 0.5 * cos(TAU * (x + vec3(0.0, 0.33, 0.67)));
+  vec3 res = mix(c, c * vec3(0.75, 0.9, 1.15), 0.5);
+  return res * res;
+}
+
+vec3 thinFilm(float ndv, float thickness) {
+  float sinT2 = (1.0 - ndv * ndv) / 1.96;
+  float cosT  = sqrt(max(1.0 - sinT2, 0.0));
+  float phase = thickness * cosT * uHoloFreq;
+  vec3  c = 0.5 + 0.5 * cos(TAU * (phase + vec3(0.0, 0.33, 0.67)));
+  return 2.0 * c * c + 0.15;
+}
+
+vec3 acesTonemap(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+vec3 toDisplay(vec3 c) {
+  return pow(acesTonemap(max(c * uExposure, 0.0)), vec3(1.0 / 2.2));
+}
+
+vec3 envLit(vec3 d) {
+  vec3 c = mix(vec3(0.004, 0.005, 0.012), vec3(0.012, 0.008, 0.03), clamp(d.y * 0.5 + 0.5, 0.0, 1.0)) * 2.0;
+  c += vec3(1.0, 0.96, 0.92) * 2.5 * smoothstep(0.25, 0.05, abs(d.x)) * smoothstep(0.55, 0.8, d.y);
+  c += vec3(0.35, 0.7, 1.3) * 1.5 * smoothstep(0.78, 0.96, dot(d, vec3(-0.94, 0.19, 0.28)));
+  return c;
+}
+
+// ---------- SDF Functions for Various Shapes ----------
+float sdBox(vec3 p, vec3 b) {
+  vec3 q = abs(p) - b;
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+float sdSphere(vec3 p, float r) {
+  return length(p) - r;
+}
+
+float sdTorus(vec3 p, vec2 t) {
+  vec2 q = vec2(length(p.xz) - t.x, p.y);
+  return length(q) - t.y;
+}
+
+float sdOctahedron(vec3 p, float s) {
+  vec3 q = abs(p);
+  return (q.x + q.y + q.z - s) * 0.57735027;
+}
+
+float sdCylinder(vec3 p, vec2 h) {
+  vec2 d = abs(vec2(length(p.xz), p.y)) - h;
+  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
+float sdGyroid(vec3 p, float scale) {
+  vec3 q = p * scale;
+  return (abs(dot(sin(q), cos(q.yzx))) - 0.18) / scale;
+}
+
+// Shape Evaluator
+float getShapeDist(vec3 r, float h) {
+  float rr = min(uCubeRound, 0.5 * h);
+
+  if (uShapeType == 1) {
+    return sdSphere(r, h);
+  } else if (uShapeType == 2) {
+    return sdTorus(r, vec2(h * 0.7, h * 0.25));
+  } else if (uShapeType == 3) {
+    return sdOctahedron(r, h * 1.1);
+  } else if (uShapeType == 4) {
+    return sdCylinder(r, vec2(h * 0.6, h)) - rr;
+  } else if (uShapeType == 5) {
+    return sdGyroid(r, 6.0);
+  }
+  return sdBox(r, vec3(h - rr)) - rr; // Default: Cube
+}
+
+float cubeDist(vec3 r, vec3 id) {
+  float k  = 0.5 - 0.5 * sin(uPulseFreq * length(id) + uPulse);
+  float h  = mix(uCubeMin, uCubeMax, k);
+  return getShapeDist(r, h);
+}
+
+float map(vec3 p, out float glowD, out float cellId) {
+  vec3 q  = (uObjRot * p) / uCell;
+  vec3 id = floor(q - uGridOff + 0.5) + uGridOff;
+  vec3 r  = q - id;
+
+  float dCube = cubeDist(r, id);
+  vec3  ar    = abs(r);
+  float dCell = 0.5 - max(ar.x, max(ar.y, ar.z)) + 0.03;
+  float dBox  = sdBox(q, vec3(uGridHalf + 0.5));
+
+  glowD  = max(dCube, dBox) * uCell;
+  cellId = length(id);
+  return max(min(dCube, dCell), dBox) * uCell;
+}
+
+float mapD(vec3 p) {
+  float g, c;
+  return map(p, g, c);
+}
+
+float mapNear(vec3 p) {
+  vec3 q    = (uObjRot * p) / uCell;
+  vec3 base = floor(q - uGridOff) + uGridOff;
+  float d = 1e9;
+  for (int i = 0; i < 8; i++) {
+    vec3 o  = vec3(float(i & 1), float((i >> 1) & 1), float(i >> 2));
+    vec3 id = clamp(base + o, -uGridHalf, uGridHalf);
+    d = min(d, cubeDist(q - id, id));
+  }
+  return d * uCell;
+}
+
+vec3 calcNormal(vec3 p, float h) {
+  const vec2 k = vec2(1.0, -1.0);
+  vec3 g = k.xyy * mapD(p + k.xyy * h) +
+           k.yyx * mapD(p + k.yyx * h) +
+           k.yxy * mapD(p + k.yxy * h) +
+           k.xxx * mapD(p + k.xxx * h);
+  return g * inversesqrt(max(dot(g, g), 1e-12));
+}
+
+float calcAO(vec3 p, vec3 n) {
+  float occ = 0.0, w = 1.0;
+  for (int i = 0; i < AO_SAMPLES; i++) {
+    float h = 0.01 + 0.08 * float(i);
+    occ += (h - mapNear(p + n * h)) * w;
+    w *= 0.6;
+  }
+  return clamp(1.0 - 2.5 * occ, 0.0, 1.0);
+}
+
+float traceInterior(vec3 ro, vec3 rd, out vec3 pExit) {
+  float t = 0.0;
+  for (int i = 0; i < INTERIOR_STEPS; i++) {
+    float d = -mapD(ro + rd * t);
+    if (d < 0.001) break;
+    t += max(d * uStepFactor, 0.008);
+    if (t > 2.0 * uBoundRadius) break;
+  }
+  pExit = ro + rd * t;
+  return t;
+}
+
+vec3 render(vec2 fragCoord) {
+  vec2 uv = (2.0 * fragCoord - uResolution) / uResolution.y;
+
+  vec3 ro = uCamPos;
+  vec3 rd = normalize(uv.x * uCamRight + uv.y * uCamUp + uFocal * uCamForward);
+
+  vec3  objCol   = vec3(0.0);
+  float coverage = 0.0;
+
+  vec2  bnd    = sphereIntersect(ro, rd, uBoundRadius);
+  float t      = max(bnd.x, 0.0);
+  float tFar   = min(bnd.y, t + uMaxDist);
+  float glow   = 0.0;
+  float cellId = 0.0;
+  bool  hit    = false;
+
+  if (bnd.y > 0.0) {
+    for (int i = 0; i < MAX_STEPS; i++) {
+      float glowD;
+      float d = map(ro + rd * t, glowD, cellId);
+      glow += exp(-glowD * 25.0) * 0.015;
+      if (d < uSurfEps * t) { hit = true; break; }
+      t += d * uStepFactor;
+      if (t > tFar) break;
+    }
+  }
+
+  if (hit) {
+    vec3  p   = ro + rd * t;
+    vec3  n   = calcNormal(p, max(uSurfEps * t, 0.0008));
+    float ao  = calcAO(p, n);
+    float ndv = clamp(dot(n, -rd), 0.0, 1.0);
+    float fr  = 1.0 - ndv;
+    float F   = 0.04 + 0.96 * fr * fr * fr * fr;
+
+    float filmThick = 1.0 + 0.25 * cellId + uHoloPhase / uHoloFreq;
+    vec3 film     = thinFilm(ndv, filmThick);
+    vec3 reflTint = mix(vec3(1.0), film, uHoloAmount);
+    vec3 refl     = envLit(reflect(rd, n)) * reflTint;
+
+    vec3 dIn = safeRefract(rd, n, 1.0 / uGlassIor);
+    vec3 pExit;
+    float thick = traceInterior(p - n * 0.01, dIn, pExit);
+    vec3  nExit = -calcNormal(pExit, 0.002);
+    vec3  iors  = uGlassIor + vec3(-uDispersion, 0.0, uDispersion);
+    vec3 trans;
+    trans.r = envLit(safeRefract(dIn, nExit, iors.r)).r;
+    trans.g = envLit(safeRefract(dIn, nExit, iors.g)).g;
+    trans.b = envLit(safeRefract(dIn, nExit, iors.b)).b;
+    trans *= exp(-thick * uGlassAbsorb);
+
+    const vec3 L = vec3(0.5306, 0.7960, -0.2908);
+    float dif  = clamp(dot(n, L), 0.0, 1.0);
+
+    objCol  = mix(trans, refl, F) * mix(0.6, 1.0, ao);
+    objCol += film * uHoloAmount * 0.08 * (0.3 + dif) * ao;
+
+    float sy = p.y - uSweepY;
+    objCol += film * exp(-sy * sy * 50.0) * 0.5;
+
+    float depth = max(t - (length(ro) - uBoundRadius), 0.0);
+    coverage = exp(-0.08 * depth * depth);
+  }
+
+  vec3 glowLin = holoPalette(0.6 + 0.25 * uv.y + uHoloPhase) * uGlowColor * glow * uGlowStrength;
+  vec3 bgWithGlow = 1.0 - (1.0 - uBgColor) * (1.0 - toDisplay(glowLin));
+  vec3 col = mix(bgWithGlow, toDisplay(objCol + glowLin), coverage);
+
+  col *= 1.0 - uScanlineAmt * (0.5 + 0.5 * sin(fragCoord.y * TAU / 3.0));
+  return col;
+}
+
+void main() {
+#if AA > 1
+  vec3 col = vec3(0.0);
+  for (int j = 0; j < AA; j++) {
+    for (int i = 0; i < AA; i++) {
+      vec2 o = (vec2(float(i), float(j)) + 0.5) / float(AA) - 0.5;
+      col += render(gl_FragCoord.xy + o);
+    }
+  }
+  col /= float(AA * AA);
+#else
+  vec3 col = render(gl_FragCoord.xy);
+#endif
+  fragColor = vec4(col, 1.0);
+}
+`;
+
+// ============================================================
+//  Setup Engine
+// ============================================================
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(PARAMS.dpr);
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+const canvas = renderer.domElement;
+
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+const geometry = new THREE.BufferGeometry();
+geometry.setAttribute('position', new THREE.Float32BufferAttribute([-1, -1, 0, 3, -1, 0, -1, 3, 0], 3));
+
+const camPos = new THREE.Vector3();
+const camRight = new THREE.Vector3();
+const camUp = new THREE.Vector3();
+const camForward = new THREE.Vector3();
+
+const uniforms = {
+  uResolution:   { value: new THREE.Vector2() },
+  uCamPos:       { value: camPos },
+  uCamRight:     { value: camRight },
+  uCamUp:        { value: camUp },
+  uCamForward:   { value: camForward },
+  uFocal:        { value: 1.0 },
+  uObjRot:       { value: new THREE.Matrix3() },
+  uPulse:        { value: 0.0 },
+  uShapeType:    { value: PARAMS.shapeType },
+  uCell:         { value: 1.0 },
+  uGridHalf:     { value: 2.0 },
+  uGridOff:      { value: 0.0 },
+  uBoundRadius:  { value: 2.0 },
+  uCubeMin:      { value: PARAMS.cubeMin },
+  uCubeMax:      { value: PARAMS.cubeMax },
+  uCubeRound:    { value: PARAMS.cubeRound },
+  uPulseFreq:    { value: PARAMS.pulseFreq },
+  uMaxDist:      { value: PARAMS.maxDist },
+  uSurfEps:      { value: PARAMS.surfEps },
+  uStepFactor:   { value: PARAMS.stepFactor },
+  uHoloFreq:     { value: PARAMS.holoFreq },
+  uHoloPhase:    { value: 0.0 },
+  uHoloAmount:   { value: PARAMS.holoAmount },
+  uSweepY:       { value: -2.5 },
+  uScanlineAmt:  { value: PARAMS.scanlines },
+  uGlowStrength: { value: PARAMS.glowStrength },
+  uGlowColor:    { value: new THREE.Vector3(1.0, 1.0, 1.0) },
+  uExposure:     { value: PARAMS.exposure },
+  uGlassIor:     { value: PARAMS.glassIor },
+  uDispersion:   { value: PARAMS.dispersion },
+  uGlassAbsorb:  { value: new THREE.Vector3(PARAMS.absorbR, PARAMS.absorbG, PARAMS.absorbB) },
+  uBgColor:      { value: new THREE.Vector3() }
+};
+
+const material = new THREE.RawShaderMaterial({
+  glslVersion: THREE.GLSL3,
+  vertexShader,
+  fragmentShader,
+  uniforms,
+  defines: {
+    MAX_STEPS: PARAMS.maxSteps,
+    AO_SAMPLES: PARAMS.aoSamples,
+    INTERIOR_STEPS: PARAMS.interiorSteps,
+    AA: PARAMS.supersampling
+  },
+  depthTest: false,
+  depthWrite: false
+});
+
+const quad = new THREE.Mesh(geometry, material);
+quad.frustumCulled = false;
+scene.add(quad);
+
+const composer = new EffectComposer(renderer);
+composer.setPixelRatio(PARAMS.dpr);
+composer.addPass(new RenderPass(scene, camera));
+const smaaPass = new SMAAPass(window.innerWidth * PARAMS.dpr, window.innerHeight * PARAMS.dpr);
+smaaPass.enabled = PARAMS.smaa;
+composer.addPass(smaaPass);
+
+function updateCamera() {
+  camPos.set(0, PARAMS.camHeight, -PARAMS.camDistance);
+  camForward.copy(camPos).negate().normalize();
+  camRight.crossVectors(WORLD_UP, camForward).normalize();
+  camUp.crossVectors(camForward, camRight);
+  uniforms.uFocal.value = 1.0 / Math.tan(THREE.MathUtils.degToRad(PARAMS.fov) * 0.5);
+}
+
+function updateBackgroundColor() {
+  const n = parseInt(PARAMS.backgroundColor.slice(1), 16);
+  uniforms.uBgColor.value.set(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
+  document.body.style.background = PARAMS.backgroundColor;
+}
+
+function updateGlassColor() {
+  const n = parseInt(PARAMS.glassColor.slice(1), 16);
+  const r = ((n >> 16) & 255) / 255;
+  const g = ((n >> 8) & 255) / 255;
+  const b = (n & 255) / 255;
+  PARAMS.absorbR = (1.0 - r) * 6.0;
+  PARAMS.absorbG = (1.0 - g) * 6.0;
+  PARAMS.absorbB = (1.0 - b) * 6.0;
+  uniforms.uGlassAbsorb.value.set(PARAMS.absorbR, PARAMS.absorbG, PARAMS.absorbB);
+}
+
+function updateGlowColor() {
+  const n = parseInt(PARAMS.glowColor.slice(1), 16);
+  uniforms.uGlowColor.value.set(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
+}
+
+function applyPreset(name) {
+  const p = PRESETS[name];
+  if (!p) return;
+  Object.assign(PARAMS, p);
+  updateBackgroundColor();
+  updateGlassColor();
+  updateGlowColor();
+  gui.controllersRecursive().forEach(c => c.updateDisplay());
+}
+
+function resize() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  renderer.setSize(w, h);
+  composer.setSize(w, h);
+  renderer.getDrawingBufferSize(uniforms.uResolution.value);
+}
+
+function setDPR(value) {
+  const dpr = THREE.MathUtils.clamp(value, 0.5, MAX_DPR);
+  renderer.setPixelRatio(dpr);
+  composer.setPixelRatio(dpr);
+  resize();
+}
+
+function setDefine(name, value) {
+  const v = Math.round(value);
+  if (material.defines[name] === v) return;
+  material.defines[name] = v;
+  material.needsUpdate = true;
+}
+
+window.addEventListener('resize', resize);
+updateCamera();
+updateBackgroundColor();
+updateGlassColor();
+updateGlowColor();
+resize();
+
+// ============================================================
+//  Animation Logic
+// ============================================================
+const anim = { rotPhase: 0, pulsePhase: 0, holoPhase: 0, sweepPhase: 0 };
+const rotY = new THREE.Matrix3();
+const rotX = new THREE.Matrix3();
+const autoRot = new THREE.Matrix3();
+const userRotT = new THREE.Matrix3();
+const userMat4 = new THREE.Matrix4();
+const userQuat = new THREE.Quaternion();
+const tmpQuat = new THREE.Quaternion();
+
+function updateAnimation(dt) {
+  const t = PARAMS.paused ? 0 : dt * PARAMS.timeScale;
+  anim.rotPhase   += t * PARAMS.rotSpeed;
+  anim.pulsePhase += t * PARAMS.pulseSpeed;
+  anim.holoPhase  += t * PARAMS.holoSpeed;
+  anim.sweepPhase += t * PARAMS.sweepSpeed;
+
+  const ay = anim.rotPhase;
+  const ax = 0.35 + 0.2 * Math.sin(anim.rotPhase * 0.7);
+  const cy = Math.cos(ay), sy = Math.sin(ay);
+  const cx = Math.cos(ax), sx = Math.sin(ax);
+  rotY.set(cy, 0, sy,   0, 1, 0,   -sy, 0, cy);
+  rotX.set(1, 0, 0,    0, cx, -sx,  0, sx, cx);
+  autoRot.multiplyMatrices(rotY, rotX);
+
+  userMat4.makeRotationFromQuaternion(userQuat);
+  userRotT.setFromMatrix4(userMat4).transpose();
+  uniforms.uObjRot.value.multiplyMatrices(autoRot, userRotT);
+
+  uniforms.uPulse.value = anim.pulsePhase;
+  uniforms.uHoloPhase.value = anim.holoPhase;
+  const s = anim.sweepPhase % 5.0;
+  uniforms.uSweepY.value = (s < 0 ? s + 5.0 : s) - 2.5;
+}
+
+function syncUniforms() {
+  const u = uniforms;
+  const n = Math.max(1, Math.round(PARAMS.gridN));
+  u.uCell.value = 2.0 * PARAMS.objectSize / n;
+  u.uGridHalf.value = 0.5 * (n - 1);
+  u.uGridOff.value = 0.5 - 0.5 * (n % 2);
+  u.uBoundRadius.value = PARAMS.objectSize * 1.7320508 + 0.02;
+
+  u.uShapeType.value = PARAMS.shapeType;
+  u.uCubeMin.value = PARAMS.cubeMin;
+  u.uCubeMax.value = PARAMS.cubeMax;
+  u.uCubeRound.value = PARAMS.cubeRound;
+  u.uPulseFreq.value = PARAMS.pulseFreq;
+
+  u.uMaxDist.value = PARAMS.maxDist;
+  u.uSurfEps.value = PARAMS.surfEps;
+  u.uStepFactor.value = PARAMS.stepFactor;
+  u.uHoloFreq.value = PARAMS.holoFreq;
+  u.uHoloAmount.value = PARAMS.holoAmount;
+  u.uScanlineAmt.value = PARAMS.scanlines;
+  u.uGlowStrength.value = PARAMS.glowStrength;
+  u.uExposure.value = PARAMS.exposure;
+  u.uGlassIor.value = PARAMS.glassIor;
+  u.uDispersion.value = PARAMS.dispersion;
+  u.uGlassAbsorb.value.set(PARAMS.absorbR, PARAMS.absorbG, PARAMS.absorbB);
+}
+
+// ============================================================
+//  Interaction
+// ============================================================
+const pointer = { dragging: false, id: -1, lastX: 0, lastY: 0, accX: 0, accY: 0 };
+const spin = { velX: 0, velY: 0 };
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  pointer.dragging = true;
+  pointer.id = e.pointerId;
+  pointer.lastX = e.clientX;
+  pointer.lastY = e.clientY;
+  pointer.accX = 0;
+  pointer.accY = 0;
+  canvas.setPointerCapture(e.pointerId);
+  canvas.classList.add('dragging');
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!pointer.dragging || e.pointerId !== pointer.id) return;
+  pointer.accX += e.clientX - pointer.lastX;
+  pointer.accY += e.clientY - pointer.lastY;
+  pointer.lastX = e.clientX;
+  pointer.lastY = e.clientY;
+});
+
+function endDrag(e) {
+  if (e.pointerId !== pointer.id) return;
+  pointer.dragging = false;
+  pointer.id = -1;
+  canvas.classList.remove('dragging');
+}
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+
+function updateUserRotation(dt) {
+  if (pointer.dragging) {
+    const sens = PARAMS.dragSensitivity * 3.0 / Math.max(window.innerHeight, 1);
+    const targetX = (pointer.accX * sens) / dt;
+    const targetY = (pointer.accY * sens) / dt;
+    pointer.accX = 0;
+    pointer.accY = 0;
+    const k = 1.0 - Math.exp(-DRAG_RESPONSE * dt);
+    spin.velX += (targetX - spin.velX) * k;
+    spin.velY += (targetY - spin.velY) * k;
+  } else {
+    const decay = Math.exp(-PARAMS.inertiaDamping * dt);
+    spin.velX *= decay;
+    spin.velY *= decay;
+  }
+
+  const angX = -spin.velX * dt;
+  const angY = -spin.velY * dt;
+  if (Math.abs(angX) + Math.abs(angY) < 1e-7) return;
+
+  tmpQuat.setFromAxisAngle(camUp, angX);
+  userQuat.premultiply(tmpQuat);
+  tmpQuat.setFromAxisAngle(camRight, angY);
+  userQuat.premultiply(tmpQuat);
+  userQuat.normalize();
+}
+
+// ============================================================
+//  GUI Panel
+// ============================================================
+const actions = {
+  resetRotation() { userQuat.identity(); spin.velX = 0; spin.velY = 0; },
+  resetTime() { for (const key in anim) anim[key] = 0; }
+};
+
+const gui = new GUI({ title: 'Settings' });
+
+const fGeom = gui.addFolder('Geometry & Shapes');
+fGeom.add(PARAMS, 'shapeType', {
+  'Kubus (Cube)': 0,
+  'Bola (Sphere)': 1,
+  'Donat (Torus)': 2,
+  'Oktahedron (Octahedron)': 3,
+  'Tabung (Cylinder)': 4,
+  'Gelombang (Gyroid)': 5
+}).name('Bentuk Objek').onChange(v => { uniforms.uShapeType.value = Number(v); });
+fGeom.add(PARAMS, 'gridN', 1, 11, 1).name('Grid Size');
+fGeom.add(PARAMS, 'objectSize', 0.3, 3, 0.01).name('Object Size');
+fGeom.add(PARAMS, 'cubeMin', 0, 0.6, 0.005).name('Cube Min Size');
+fGeom.add(PARAMS, 'cubeMax', 0, 0.7, 0.005).name('Cube Max Size');
+fGeom.add(PARAMS, 'cubeRound', 0, 0.35, 0.005).name('Edge Rounding');
+
+const fColors = gui.addFolder('Colors & Themes');
+fColors.add(PARAMS, 'presetTheme', Object.keys(PRESETS)).name('Preset Theme').onChange(applyPreset);
+fColors.addColor(PARAMS, 'backgroundColor').name('Background').onChange(updateBackgroundColor);
+fColors.addColor(PARAMS, 'glassColor').name('Glass Tint').onChange(updateGlassColor);
+fColors.addColor(PARAMS, 'glowColor').name('Glow Color').onChange(updateGlowColor);
+
+const fPerf = gui.addFolder('Performance & FPS');
+fPerf.add(PARAMS, 'showFps').name('Show FPS Monitor').onChange((v) => {
+  stats.dom.style.display = v ? 'block' : 'none';
+});
+fPerf.add(PARAMS, 'dpr', 0.5, MAX_DPR, 0.25).name('DPR Scale').onChange(setDPR);
+fPerf.add(PARAMS, 'maxSteps', 16, 120, 1).name('Max March Steps')
+  .onFinishChange((v) => setDefine('MAX_STEPS', v));
+fPerf.add(PARAMS, 'interiorSteps', 8, 60, 1).name('Interior Steps')
+  .onFinishChange((v) => setDefine('INTERIOR_STEPS', v));
+fPerf.add(PARAMS, 'aoSamples', 0, 6, 1).name('AO Quality')
+  .onFinishChange((v) => setDefine('AO_SAMPLES', v));
+
+const fAnim = gui.addFolder('Animation');
+fAnim.add(PARAMS, 'timeScale', 0, 3, 0.01).name('Time Scale');
+fAnim.add(PARAMS, 'paused').name('Paused');
+fAnim.add(actions, 'resetRotation').name('Reset Rotation');
+
+gui.close();
+
+// ============================================================
+//  Render Loop
+// ============================================================
+let lastTime = performance.now();
+
+document.addEventListener('visibilitychange', () => { lastTime = performance.now(); });
+
+function frame() {
+  stats.begin();
+
+  const now = performance.now();
+  const dt = Math.min(Math.max((now - lastTime) / 1000, 1e-4), MAX_DELTA);
+  lastTime = now;
+
+  updateUserRotation(dt);
+  updateAnimation(dt);
+  syncUniforms();
+
+  composer.render();
+
+  stats.end();
+}
+
+renderer.setAnimationLoop(frame);
+</script>
+</body>
+</html>
